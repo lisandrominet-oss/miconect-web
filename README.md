@@ -1,4 +1,28 @@
-# vinext-starter
+# Miconect
+
+Portal B2B de compraventa minera para empresas compradoras y proveedores de
+San Juan. Este repositorio conserva el frontend, las migraciones SQL y las
+tres Edge Functions productivas de Supabase.
+
+## Despliegue en Vercel
+
+El proyecto mantiene el build de Sites y agrega un build independiente para
+Vercel. Al importar el repositorio en Vercel se debe usar la raíz del proyecto;
+`vercel.json` selecciona Next.js y ejecuta `npm run build:vercel`.
+
+El dominio `miconect.com` no debe asignarse al proyecto de Vercel hasta terminar
+la prueba funcional con la URL temporal. Esa URL temporal también debe agregarse
+a la lista de orígenes permitidos de las Edge Functions, según se explica en
+`supabase/functions/README.md`.
+
+## Fuentes de Supabase
+
+- Migraciones: `supabase/migrations/`
+- Edge Functions: `supabase/functions/`
+
+La versión migrada corresponde a la versión 57 de Sites.
+
+## Base técnica de Sites
 
 A clean full-stack starter running on
 [vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
