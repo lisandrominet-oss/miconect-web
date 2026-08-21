@@ -4,6 +4,7 @@ import { createClient } from "npm:@supabase/supabase-js@2";
 const allowedOrigins = new Set([
   "https://miconect.com",
   "https://www.miconect.com",
+  "https://miconect-web.vercel.app",
   "https://portal-minero-san-juan.liminregg.chatgpt.site",
 ]);
 

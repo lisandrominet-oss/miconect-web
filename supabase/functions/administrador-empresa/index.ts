@@ -1,5 +1,16 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 
+const allowedAppOrigins = new Set([
+  "https://miconect.com",
+  "https://www.miconect.com",
+  "https://miconect-web.vercel.app",
+  "https://portal-minero-san-juan.liminregg.chatgpt.site",
+]);
+
+function resolveAppOrigin(origin: string | null) {
+  return origin && allowedAppOrigins.has(origin) ? origin : "https://miconect.com";
+}
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
@@ -117,6 +128,7 @@ Deno.serve(async (request) => {
   }
 
   try {
+    const appOrigin = resolveAppOrigin(request.headers.get("origin"));
     const authorization = request.headers.get("Authorization") ?? "";
     if (!authorization.toLowerCase().startsWith("bearer ")) {
       return response({ error: "Sesion requerida" }, 401);
@@ -183,7 +195,7 @@ Deno.serve(async (request) => {
       if (!available) return response({ error: "El correo esta bloqueado" }, 409);
 
       const invite = await admin.auth.admin.inviteUserByEmail(email, {
-        redirectTo: "https://miconect.com",
+        redirectTo: appOrigin,
         data: { miconect_admin_created: true },
       });
       if (invite.error || !invite.data.user) {
@@ -264,10 +276,10 @@ Deno.serve(async (request) => {
           ? await mailClient.auth.resend({
               type: "signup",
               email,
-              options: { emailRedirectTo: "https://miconect.com" },
+              options: { emailRedirectTo: appOrigin },
             })
           : await mailClient.auth.resetPasswordForEmail(email, {
-              redirectTo: "https://miconect.com",
+              redirectTo: appOrigin,
             });
       if (result.error) throw result.error;
       await audit(admin, companyId, userResult.user.id, action, { email });

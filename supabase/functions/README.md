@@ -28,7 +28,11 @@ La función `administrador-empresa` también admite los secretos empaquetados
 
 ## Migración del frontend
 
-Las funciones con lista de orígenes permitidos aceptan actualmente
-`miconect.com`, `www.miconect.com` y el despliegue vigente de Sites. Antes de
-probar el frontend migrado se debe agregar explícitamente el origen temporal
-del nuevo hosting y retirarlo cuando deje de utilizarse.
+Las funciones aceptan actualmente `miconect.com`, `www.miconect.com`, el
+despliegue vigente de Sites y `miconect-web.vercel.app`. Los enlaces de acceso
+generados por `administrador-empresa` vuelven al origen autorizado desde el que
+se solicitó la operación.
+
+En Supabase Auth se debe conservar `https://miconect.com` como **Site URL** y
+agregar `https://miconect-web.vercel.app/**` a **Additional Redirect URLs**
+mientras se prueba el frontend migrado.
