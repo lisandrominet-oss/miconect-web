@@ -1,27 +1,82 @@
-import { createClient } from "npm:@supabase/supabase-js@2";
+/// <reference lib="deno.ns" />
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.112.2";
+
+type AdminClient = SupabaseClient;
 
 const allowedAppOrigins = new Set([
   "https://miconect.com",
   "https://www.miconect.com",
   "https://miconect-web.vercel.app",
-  "https://portal-minero-san-juan.liminregg.chatgpt.site",
 ]);
 
 function resolveAppOrigin(origin: string | null) {
-  return origin && allowedAppOrigins.has(origin) ? origin : "https://miconect.com";
+  return origin && allowedAppOrigins.has(origin) ? origin : null;
 }
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+function corsHeaders(origin: string) {
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin",
+  };
+}
 
-function response(body: Record<string, unknown>, status = 200) {
+function response(origin: string, body: Record<string, unknown>, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    headers: {
+      ...corsHeaders(origin),
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    },
   });
+}
+
+async function sha256(value: string) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+}
+
+function requestIp(request: Request) {
+  return request.headers.get("cf-connecting-ip") ??
+    request.headers.get("x-real-ip") ??
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    "unknown";
+}
+
+function jwtAssuranceLevel(authorization: string) {
+  try {
+    const token = authorization.slice(7).trim();
+    const payload = token.split(".")[1];
+    if (!payload) return "";
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/")
+      .padEnd(Math.ceil(payload.length / 4) * 4, "=");
+    const parsed = JSON.parse(atob(normalized)) as { aal?: unknown };
+    return typeof parsed.aal === "string" ? parsed.aal : "";
+  } catch {
+    return "";
+  }
+}
+
+async function consumeRateLimit(
+  admin: AdminClient,
+  scope: string,
+  subject: string,
+  limit: number,
+  windowSeconds: number,
+) {
+  const { data, error } = await admin.rpc("consumir_limite_edge", {
+    p_scope: scope,
+    p_subject_hash: await sha256(subject),
+    p_limit: limit,
+    p_window_seconds: windowSeconds,
+  });
+  if (error) throw error;
+  return data === true;
 }
 
 function firstBundledSecret(name: string) {
@@ -57,7 +112,7 @@ type CompanyUser = {
   rol: string;
 };
 
-async function operationCounts(admin: ReturnType<typeof createClient>, companyId: string) {
+async function operationCounts(admin: AdminClient, companyId: string) {
   const [requests, quotes, awards] = await Promise.all([
     admin
       .from("solicitudes")
@@ -81,7 +136,7 @@ async function operationCounts(admin: ReturnType<typeof createClient>, companyId
   };
 }
 
-async function companyUsers(admin: ReturnType<typeof createClient>, companyId: string) {
+async function companyUsers(admin: AdminClient, companyId: string) {
   const { data, error } = await admin
     .from("perfiles")
     .select("id, nombre, apellido, rol")
@@ -104,7 +159,7 @@ async function companyUsers(admin: ReturnType<typeof createClient>, companyId: s
 }
 
 async function audit(
-  admin: ReturnType<typeof createClient>,
+  admin: AdminClient,
   companyId: string | null,
   userId: string,
   action: string,
@@ -121,17 +176,31 @@ async function audit(
 }
 
 Deno.serve(async (request) => {
-  if (request.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
-  if (request.method !== "POST") return response({ error: "Metodo no permitido" }, 405);
+  const appOrigin = resolveAppOrigin(request.headers.get("origin"));
+  if (!appOrigin) {
+    return new Response(JSON.stringify({ error: "Origen no autorizado" }), {
+      status: 403,
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  }
+  const reply = (body: Record<string, unknown>, status = 200) =>
+    response(appOrigin, body, status);
+
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders(appOrigin) });
+  }
+  if (request.method !== "POST") return reply({ error: "Metodo no permitido" }, 405);
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (contentLength > 64 * 1024) return reply({ error: "Solicitud demasiado grande" }, 413);
   if (!supabaseUrl || !publishableKey || !secretKey) {
-    return response({ error: "Faltan secretos del proyecto" }, 500);
+    console.error("administrador-empresa: missing required project secrets");
+    return reply({ error: "Servicio temporalmente no disponible" }, 503);
   }
 
   try {
-    const appOrigin = resolveAppOrigin(request.headers.get("origin"));
     const authorization = request.headers.get("Authorization") ?? "";
     if (!authorization.toLowerCase().startsWith("bearer ")) {
-      return response({ error: "Sesion requerida" }, 401);
+      return reply({ error: "Sesion requerida" }, 401);
     }
 
     const userClient = createClient(supabaseUrl, publishableKey, {
@@ -139,18 +208,28 @@ Deno.serve(async (request) => {
       auth: { persistSession: false, autoRefreshToken: false },
     });
     const { data: userResult, error: userError } = await userClient.auth.getUser();
-    if (userError || !userResult.user) return response({ error: "Sesion invalida" }, 401);
+    if (userError || !userResult.user) return reply({ error: "Sesion invalida" }, 401);
+    if (jwtAssuranceLevel(authorization) !== "aal2") {
+      return reply({ error: "Verificacion de dos pasos requerida" }, 403);
+    }
 
     const admin = createClient(supabaseUrl, secretKey, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
+    const [userLimitOk, ipLimitOk] = await Promise.all([
+      consumeRateLimit(admin, "administrador-empresa:user", userResult.user.id, 60, 60),
+      consumeRateLimit(admin, "administrador-empresa:ip", requestIp(request), 120, 60),
+    ]);
+    if (!userLimitOk || !ipLimitOk) {
+      return reply({ error: "Demasiadas solicitudes. Intentá nuevamente en un minuto." }, 429);
+    }
     const { data: profile, error: profileError } = await admin
       .from("perfiles")
       .select("rol")
       .eq("id", userResult.user.id)
       .maybeSingle();
     if (profileError || profile?.rol !== "administrador_plataforma") {
-      return response({ error: "Acceso reservado al administrador de plataforma" }, 403);
+      return reply({ error: "Acceso reservado al administrador de plataforma" }, 403);
     }
 
     const body = await request.json();
@@ -158,12 +237,12 @@ Deno.serve(async (request) => {
     const companyId = body.empresa_id ? String(body.empresa_id) : "";
 
     if (action === "detalle_empresa") {
-      if (!companyId) return response({ error: "Falta la empresa" }, 400);
+      if (!companyId) return reply({ error: "Falta la empresa" }, 400);
       const [users, counts] = await Promise.all([
         companyUsers(admin, companyId),
         operationCounts(admin, companyId),
       ]);
-      return response({
+      return reply({
         usuarios: users,
         actividad: counts,
         puede_eliminar:
@@ -181,25 +260,26 @@ Deno.serve(async (request) => {
         ? body.rubros.map(Number).filter(Number.isFinite)
         : [];
       if (!email || !body.razon_social || !body.cuit || !body.localidad) {
-        return response({ error: "Completá los datos obligatorios" }, 400);
+        return reply({ error: "Completá los datos obligatorios" }, 400);
       }
-      if (!canBuy && !canSell) return response({ error: "Elegí al menos una actividad" }, 400);
+      if (!canBuy && !canSell) return reply({ error: "Elegí al menos una actividad" }, 400);
       if (canSell && !categories.length) {
-        return response({ error: "Asigná al menos un rubro al proveedor" }, 400);
+        return reply({ error: "Asigná al menos un rubro al proveedor" }, 400);
       }
       const { data: available, error: availableError } = await admin.rpc(
         "email_disponible_registro",
         { p_email: email },
       );
       if (availableError) throw availableError;
-      if (!available) return response({ error: "El correo esta bloqueado" }, 409);
+      if (!available) return reply({ error: "No se pudo crear el acceso con los datos indicados" }, 409);
 
       const invite = await admin.auth.admin.inviteUserByEmail(email, {
         redirectTo: appOrigin,
         data: { miconect_admin_created: true },
       });
       if (invite.error || !invite.data.user) {
-        return response({ error: invite.error?.message ?? "No se pudo crear el acceso" }, 409);
+        console.error("administrador-empresa: invite failed", invite.error);
+        return reply({ error: "No se pudo crear el acceso con los datos indicados" }, 409);
       }
 
       const userId = invite.data.user.id;
@@ -257,16 +337,16 @@ Deno.serve(async (request) => {
         puede_comprar: canBuy,
         puede_vender: canSell,
       });
-      return response({ ok: true, empresa_id: newCompanyId, usuario_id: userId });
+      return reply({ ok: true, empresa_id: newCompanyId, usuario_id: userId });
     }
 
-    if (!companyId) return response({ error: "Falta la empresa" }, 400);
+    if (!companyId) return reply({ error: "Falta la empresa" }, 400);
     const users = await companyUsers(admin, companyId);
 
     if (action === "reenviar_acceso" || action === "restablecer_password") {
       const email = String(body.email ?? "").trim().toLowerCase();
       if (!users.some((user) => user.email.toLowerCase() === email)) {
-        return response({ error: "El usuario no pertenece a la empresa" }, 403);
+        return reply({ error: "El usuario no pertenece a la empresa" }, 403);
       }
       const mailClient = createClient(supabaseUrl, publishableKey, {
         auth: { persistSession: false, autoRefreshToken: false },
@@ -283,7 +363,7 @@ Deno.serve(async (request) => {
             });
       if (result.error) throw result.error;
       await audit(admin, companyId, userResult.user.id, action, { email });
-      return response({ ok: true });
+      return reply({ ok: true });
     }
 
     if (action === "pausar" || action === "reactivar" || action === "archivar") {
@@ -296,12 +376,12 @@ Deno.serve(async (request) => {
       await audit(admin, companyId, userResult.user.id, `empresa_${action}`, {
         motivo: String(body.motivo ?? "").trim() || null,
       });
-      return response({ ok: true, estado_operativo: status });
+      return reply({ ok: true, estado_operativo: status });
     }
 
     if (action === "bloquear") {
       const reason = String(body.motivo ?? "").trim();
-      if (!reason) return response({ error: "Indicá el motivo del bloqueo" }, 400);
+      if (!reason) return reply({ error: "Indicá el motivo del bloqueo" }, 400);
       for (const user of users) {
         if (user.email) {
           const existing = await admin
@@ -330,7 +410,7 @@ Deno.serve(async (request) => {
         .eq("id", companyId);
       if (update.error) throw update.error;
       await audit(admin, companyId, userResult.user.id, "empresa_bloqueada", { motivo: reason });
-      return response({ ok: true, estado_operativo: "bloqueada" });
+      return reply({ ok: true, estado_operativo: "bloqueada" });
     }
 
     if (action === "desbloquear") {
@@ -357,13 +437,13 @@ Deno.serve(async (request) => {
         .eq("id", companyId);
       if (update.error) throw update.error;
       await audit(admin, companyId, userResult.user.id, "empresa_desbloqueada", {});
-      return response({ ok: true, estado_operativo: "activa" });
+      return reply({ ok: true, estado_operativo: "activa" });
     }
 
     if (action === "eliminar_incompleta") {
       const counts = await operationCounts(admin, companyId);
       if (counts.solicitudes || counts.cotizaciones || counts.adjudicaciones) {
-        return response(
+        return reply(
           { error: "La empresa tiene actividad comercial y no puede eliminarse" },
           409,
         );
@@ -387,15 +467,12 @@ Deno.serve(async (request) => {
       const paths = (documents.data ?? []).map((document) => document.archivo_path);
       if (paths.length) await admin.storage.from("documentos-empresas").remove(paths);
 
-      return response({ ok: true, usuarios_no_eliminados: failedUsers });
+      return reply({ ok: true, usuarios_no_eliminados: failedUsers });
     }
 
-    return response({ error: "Accion desconocida" }, 400);
+    return reply({ error: "Accion desconocida" }, 400);
   } catch (error) {
     console.error(error);
-    return response(
-      { error: error instanceof Error ? error.message : "No se pudo completar la operacion" },
-      500,
-    );
+    return reply({ error: "No se pudo completar la operacion" }, 500);
   }
 });

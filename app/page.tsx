@@ -1,13 +1,40 @@
 "use client";
 
-/* eslint-disable react-hooks/set-state-in-effect, react-hooks/immutability, react-hooks/purity */
+/* eslint-disable react-hooks/set-state-in-effect */
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (
+        container: HTMLElement,
+        options: {
+          sitekey: string;
+          callback: (token: string) => void;
+          "expired-callback": () => void;
+          "error-callback": () => void;
+          theme: "auto";
+        },
+      ) => string;
+      remove: (widgetId: string) => void;
+    };
+  }
+}
+
+const turnstileSiteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY ?? "";
+
 const supabase = createClient(
   "https://pexamdyctxcxelshixfz.supabase.co",
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBleGFtZHljdHhjeGVsc2hpeGZ6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYzMTc1MTcsImV4cCI6MjEwMTg5MzUxN30.7MnfNlfiof6KyGRGKzd0JzbK3X_jMqQ--b0Micm3uxY",
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: true,
+      detectSessionInUrl: true,
+    },
+  },
 );
 
 type View = "home" | "login" | "register" | "invite" | "recover";
@@ -63,24 +90,6 @@ type Account = {
     estado_operativo: OperationalStatus;
   };
 };
-
-function createUuid() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  const bytes = new Uint8Array(16);
-  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
-    crypto.getRandomValues(bytes);
-  } else {
-    for (let index = 0; index < bytes.length; index += 1) {
-      bytes[index] = Math.floor(Math.random() * 256);
-    }
-  }
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const value = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
-}
 
 type Row = { id: string; title: string; meta: string; state: string };
 type AdminRequestItem = {
@@ -332,11 +341,44 @@ type CompanyInvitation = {
   id: string;
   email: string;
   rol: "miembro" | "administrador_empresa";
-  token: string;
   creada_en: string;
   vence_en: string;
   usada_en: string | null;
 };
+
+function safeHttpsUrl(value: unknown): string | null {
+  try {
+    const url = new URL(String(value ?? ""));
+    return url.protocol === "https:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function readSessionJson<T>(key: string): T | null {
+  const raw = sessionStorage.getItem(key);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    sessionStorage.removeItem(key);
+    return null;
+  }
+}
+
+async function uploadSecureFile(
+  type: "adjunto_solicitud" | "constancia_cuit" | "pdf_cotizacion" | "publicidad",
+  entityId: string,
+  file: File,
+) {
+  const body = new FormData();
+  body.set("tipo", type);
+  body.set("entidad_id", entityId);
+  body.set("archivo", file);
+  const { data, error } = await supabase.functions.invoke("subir-archivo-seguro", { body });
+  if (error || !data?.path) throw new Error("No se pudo validar y cargar el archivo.");
+  return String(data.path);
+}
 type Advertiser = {
   id: string;
   nombre: string;
@@ -396,7 +438,7 @@ function friendlyAuthError(error: { message?: string; status?: number } | null) 
   if (message.includes("user already registered"))
     return "Ya existe una cuenta con este correo. Ingresá o restablecé la contraseña.";
   if (message.includes("password should be"))
-    return "La contraseña debe tener al menos ocho caracteres.";
+    return "La contraseña debe tener al menos doce caracteres e incluir mayúsculas, minúsculas, números y símbolos.";
   if (message.includes("signup is disabled"))
     return "El registro está temporalmente deshabilitado. Intentá nuevamente más tarde.";
   if (message.includes("otp_expired") || message.includes("link is invalid") || message.includes("has expired"))
@@ -430,10 +472,19 @@ function registrationErrorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
+function sanitizeUiMessage(value: string) {
+  const technicalDetail =
+    /(?:sqlstate|postgres|postgrest|stack|relation |column |constraint |policy |jwt|rls|duplicate key|permission denied|violates |schema cache|pgrst\d|22p\d|23\d{3}|42\d{3})/i;
+  if (value.length > 280 || technicalDetail.test(value)) {
+    return "No pudimos completar la operación. Intentá nuevamente o contactá a soporte.";
+  }
+  return value;
+}
+
 function PasswordInput({
   name,
   autoComplete,
-  minLength = 8,
+  minLength = 12,
   required = true,
 }: {
   name: string;
@@ -463,10 +514,65 @@ function PasswordInput({
   );
 }
 
+function TurnstileChallenge({ onToken }: { onToken: (token: string) => void }) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!turnstileSiteKey) {
+      onToken("");
+      return;
+    }
+
+    let widgetId = "";
+    let cancelled = false;
+    const renderWidget = () => {
+      if (cancelled || !containerRef.current || !window.turnstile || widgetId) return;
+      widgetId = window.turnstile.render(containerRef.current, {
+        sitekey: turnstileSiteKey,
+        callback: onToken,
+        "expired-callback": () => onToken(""),
+        "error-callback": () => onToken(""),
+        theme: "auto",
+      });
+    };
+
+    let script = document.querySelector<HTMLScriptElement>(
+      'script[data-miconect-turnstile="true"]',
+    );
+    if (!script) {
+      script = document.createElement("script");
+      script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+      script.async = true;
+      script.defer = true;
+      script.dataset.miconectTurnstile = "true";
+      document.head.appendChild(script);
+    }
+    script.addEventListener("load", renderWidget);
+    renderWidget();
+
+    return () => {
+      cancelled = true;
+      script?.removeEventListener("load", renderWidget);
+      if (widgetId && window.turnstile) window.turnstile.remove(widgetId);
+      onToken("");
+    };
+  }, [onToken]);
+
+  if (!turnstileSiteKey) {
+    return (
+      <p className="captcha-configuration-error" role="alert">
+        La protección antibots no está configurada. Contactá a soporte.
+      </p>
+    );
+  }
+  return <div className="turnstile-challenge" ref={containerRef} />;
+}
+
 export default function Home() {
   const [view, setView] = useState<View>("home");
   const [legalDocument, setLegalDocument] = useState<LegalDocument | null>(null);
-  const [message, setMessage] = useState("");
+  const [message, setMessageState] = useState("");
+  const setMessage = (value: string) => setMessageState(sanitizeUiMessage(value));
   const [busy, setBusy] = useState(false);
   const [pendingConfirmationEmail, setPendingConfirmationEmail] = useState("");
   const [confirmationMessage, setConfirmationMessage] = useState("");
@@ -640,6 +746,14 @@ export default function Home() {
   const [passwordRecovery, setPasswordRecovery] = useState(false);
   const [loginEmail, setLoginEmail] = useState("");
   const [rememberLoginEmail, setRememberLoginEmail] = useState(false);
+  const [captchaToken, setCaptchaToken] = useState("");
+  const [captchaGeneration, setCaptchaGeneration] = useState(0);
+  const [adminMfaStatus, setAdminMfaStatus] = useState<
+    "idle" | "checking" | "enroll" | "challenge" | "verified" | "error"
+  >("idle");
+  const [adminMfaFactorId, setAdminMfaFactorId] = useState("");
+  const [adminMfaQrCode, setAdminMfaQrCode] = useState("");
+  const [passwordNonceRequested, setPasswordNonceRequested] = useState(false);
   const [orphanUser, setOrphanUser] = useState<{
     id: string;
     email: string;
@@ -667,6 +781,17 @@ export default function Home() {
     ids: Set<string>;
   } | null>(null);
   const notificationRefreshInFlightRef = useRef(false);
+
+  function resetCaptcha() {
+    setCaptchaToken("");
+    setCaptchaGeneration((current) => current + 1);
+  }
+
+  function requireCaptcha() {
+    if (turnstileSiteKey && captchaToken) return true;
+    setMessage("Completá la verificación antibots para continuar.");
+    return false;
+  }
 
   function getWhatsAppUrl(phone: string) {
     let digits = phone.replace(/\D/g, "");
@@ -699,21 +824,9 @@ export default function Home() {
     else setQuoteOpen(true);
   }
 
-  function advertisingVisitorId() {
-    const key = "miconect-ad-visitor";
-    let value = localStorage.getItem(key);
-    if (!value) {
-      value = createUuid();
-      localStorage.setItem(key, value);
-    }
-    return value;
-  }
-
   async function registerAdEvent(adId: string, type: "impresion" | "clic") {
-    await supabase.rpc("registrar_evento_publicidad", {
-      p_anuncio_id: adId,
-      p_tipo: type,
-      p_visitante_id: advertisingVisitorId(),
+    await supabase.functions.invoke("evento-publicidad", {
+      body: { anuncio_id: adId, tipo: type },
     });
   }
 
@@ -783,7 +896,7 @@ export default function Home() {
   }, [providerView, account?.empresas?.puede_vender, account?.empresas?.tipo]);
 
   useEffect(() => {
-    const remembered = localStorage.getItem("miconect-remembered-email") ?? "";
+    const remembered = sessionStorage.getItem("miconect-remembered-email") ?? "";
     setLoginEmail(remembered);
     setRememberLoginEmail(Boolean(remembered));
   }, []);
@@ -803,10 +916,13 @@ export default function Home() {
   }, [view]);
 
   useEffect(() => {
-    const token = new URLSearchParams(window.location.search).get("invite");
+    const queryToken = new URLSearchParams(window.location.search).get("invite");
+    const hashToken = new URLSearchParams(window.location.hash.slice(1)).get("invite");
+    const token = queryToken || hashToken;
     if (token) {
       setInviteToken(token);
       setView("invite");
+      window.history.replaceState({}, "", window.location.pathname);
     }
     supabase.auth.getSession().then(({ data }) => {
       if (data.session?.user) {
@@ -926,8 +1042,9 @@ export default function Home() {
   async function finishPendingRegistration(
     pendingOverride?: Record<string, unknown> | null,
   ) {
-    const raw = localStorage.getItem("miconect-pending-company");
-    const pending = pendingOverride ?? (raw ? JSON.parse(raw) : null);
+    const pending = pendingOverride ?? readSessionJson<Record<string, unknown>>(
+      "miconect-pending-company",
+    );
     if (!pending) return false;
     const {
       p_rubros,
@@ -982,7 +1099,7 @@ export default function Home() {
           `La empresa se vinculó, pero los rubros no pudieron guardarse: ${categoryError}`,
         );
     }
-    localStorage.removeItem("miconect-pending-company");
+    sessionStorage.removeItem("miconect-pending-company");
     if (userData.user?.user_metadata?.miconect_pending_company) {
       await supabase.auth.updateUser({
         data: { miconect_pending_company: null },
@@ -992,22 +1109,90 @@ export default function Home() {
   }
 
   async function finishPendingInvite() {
-    const raw = localStorage.getItem("miconect-pending-invite");
-    if (!raw) return false;
-    const pending = JSON.parse(raw) as {
+    const pending = readSessionJson<{
       token: string;
       nombre: string;
       apellido: string;
-    };
+    }>("miconect-pending-invite");
+    if (!pending) return false;
     const { error } = await supabase.rpc("aceptar_invitacion_empresa", {
       p_token: pending.token,
       p_nombre: pending.nombre,
       p_apellido: pending.apellido,
     });
     if (error) throw error;
-    localStorage.removeItem("miconect-pending-invite");
+    sessionStorage.removeItem("miconect-pending-invite");
     window.history.replaceState({}, "", window.location.pathname);
     return true;
+  }
+
+  async function initializeAdminMfa() {
+    setAdminMfaStatus("checking");
+    setAdminMfaQrCode("");
+    const { data: assurance, error: assuranceError } =
+      await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+    if (assuranceError) {
+      setAdminMfaStatus("error");
+      return false;
+    }
+    if (assurance.currentLevel === "aal2") {
+      setAdminMfaStatus("verified");
+      return true;
+    }
+
+    const { data: factors, error: factorsError } = await supabase.auth.mfa.listFactors();
+    if (factorsError) {
+      setAdminMfaStatus("error");
+      return false;
+    }
+    const verifiedFactor = factors.totp.find((factor) => factor.status === "verified");
+    if (verifiedFactor) {
+      setAdminMfaFactorId(verifiedFactor.id);
+      setAdminMfaStatus("challenge");
+      return false;
+    }
+
+    for (const factor of factors.all.filter((item) => item.status !== "verified")) {
+      await supabase.auth.mfa.unenroll({ factorId: factor.id });
+    }
+    const { data: enrollment, error: enrollmentError } = await supabase.auth.mfa.enroll({
+      factorType: "totp",
+      friendlyName: "Miconect Administracion",
+    });
+    if (enrollmentError) {
+      setAdminMfaStatus("error");
+      return false;
+    }
+    setAdminMfaFactorId(enrollment.id);
+    setAdminMfaQrCode(enrollment.totp.qr_code);
+    setAdminMfaStatus("enroll");
+    return false;
+  }
+
+  async function verifyAdminMfa(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const code = String(new FormData(event.currentTarget).get("code") ?? "")
+      .replace(/\D/g, "");
+    if (!/^\d{6}$/.test(code) || !adminMfaFactorId) {
+      setMessage("Ingresá el código de seis dígitos de tu aplicación autenticadora.");
+      return;
+    }
+    setBusy(true);
+    setMessage("");
+    const { error } = await supabase.auth.mfa.challengeAndVerify({
+      factorId: adminMfaFactorId,
+      code,
+    });
+    if (error) {
+      setMessage("El código no es válido o venció. Generá uno nuevo e intentá otra vez.");
+      setBusy(false);
+      return;
+    }
+    setAdminMfaStatus("verified");
+    event.currentTarget.reset();
+    const user = (await supabase.auth.getUser()).data.user;
+    if (user) await loadAccount(user.id);
+    setBusy(false);
   }
 
   async function loadAccount(userId: string) {
@@ -1047,9 +1232,15 @@ export default function Home() {
         activeUserRef.current = userId;
         setOrphanUser(null);
         setAccount(next);
+        if (next.rol === "administrador_plataforma") {
+          const mfaVerified = await initializeAdminMfa();
+          if (!mfaVerified) return;
+        } else {
+          setAdminMfaStatus("idle");
+        }
         const canBuy = companyCanBuy(next.empresas);
         const canSell = companyCanSell(next.empresas);
-        const rememberedMode = localStorage.getItem(
+        const rememberedMode = sessionStorage.getItem(
           "miconect-company-mode",
         ) as CompanyMode | null;
         const initialMode: CompanyMode =
@@ -1161,12 +1352,12 @@ export default function Home() {
     setNotificationOpen(false);
     if (notification.tipo === "nueva_solicitud") {
       setCompanyMode("provider");
-      localStorage.setItem("miconect-company-mode", "provider");
+      sessionStorage.setItem("miconect-company-mode", "provider");
       setProviderView("requests");
       if (account) await loadRows(account, "provider");
     } else if (notification.tipo === "cotizacion_recibida") {
       setCompanyMode("buyer");
-      localStorage.setItem("miconect-company-mode", "buyer");
+      sessionStorage.setItem("miconect-company-mode", "buyer");
       const updatedQuotes = await loadBuyerQuotes();
       const relatedQuote = updatedQuotes.find(
         (quote) =>
@@ -1180,7 +1371,7 @@ export default function Home() {
       }
     } else if (notification.tipo === "adjudicacion_recibida" && account) {
       setCompanyMode("provider");
-      localStorage.setItem("miconect-company-mode", "provider");
+      sessionStorage.setItem("miconect-company-mode", "provider");
       setProviderView("awards");
       await loadAwards(account);
     }
@@ -1217,7 +1408,7 @@ export default function Home() {
     if (account.rol === "administrador_empresa") {
       const { data: invitations } = await supabase
         .from("invitaciones_empresa")
-        .select("id, email, rol, token, creada_en, vence_en, usada_en")
+        .select("id, email, rol, creada_en, vence_en, usada_en")
         .eq("empresa_id", account.empresas.id)
         .order("creada_en", { ascending: false });
       setTeamInvitations((invitations ?? []) as CompanyInvitation[]);
@@ -1240,7 +1431,7 @@ export default function Home() {
       setBusy(false);
       return;
     }
-    const link = `${window.location.origin}${window.location.pathname}?invite=${data}`;
+    const link = `${window.location.origin}${window.location.pathname}#invite=${encodeURIComponent(String(data))}`;
     setInvitationLink(link);
     const { error: emailError } = await supabase.functions.invoke(
       "enviar-invitacion-empresa",
@@ -1291,6 +1482,7 @@ export default function Home() {
 
   async function acceptTeamInvitation(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!requireCaptcha()) return;
     const form = new FormData(event.currentTarget);
     const email = String(form.get("email"));
     const password = String(form.get("password"));
@@ -1304,18 +1496,20 @@ export default function Home() {
       nombre: String(form.get("nombre")),
       apellido: String(form.get("apellido")),
     };
-    localStorage.setItem("miconect-pending-invite", JSON.stringify(pending));
+    sessionStorage.setItem("miconect-pending-invite", JSON.stringify(pending));
     setBusy(true);
     setMessage("");
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: {
-        emailRedirectTo: `${window.location.origin}${window.location.pathname}?invite=${inviteToken}`,
+        emailRedirectTo: `${window.location.origin}${window.location.pathname}#invite=${encodeURIComponent(inviteToken)}`,
+        captchaToken,
       },
     });
+    resetCaptcha();
     if (error) {
-      localStorage.removeItem("miconect-pending-invite");
+      sessionStorage.removeItem("miconect-pending-invite");
       setMessage(error.message);
       setBusy(false);
       return;
@@ -1444,27 +1638,53 @@ export default function Home() {
     const form = new FormData(event.currentTarget);
     const password = String(form.get("password"));
     const confirmation = String(form.get("confirmation"));
+    const nonce = String(form.get("nonce") ?? "").replace(/\D/g, "");
     if (password !== confirmation) {
       setMessage("Las contraseñas no coinciden.");
       return;
     }
+    if (!/^\d{6}$/.test(nonce)) {
+      setMessage("Solicitá e ingresá el código de seguridad enviado a tu correo.");
+      return;
+    }
     setBusy(true);
     setMessage("");
-    const { error } = await supabase.auth.updateUser({ password });
+    const { error } = await supabase.auth.updateUser({ password, nonce });
     setMessage(error ? error.message : "Contraseña actualizada correctamente.");
-    if (!error) event.currentTarget.reset();
+    if (!error) {
+      event.currentTarget.reset();
+      setPasswordNonceRequested(false);
+    }
+    setBusy(false);
+  }
+
+  async function requestPasswordNonce() {
+    setBusy(true);
+    setMessage("");
+    const { error } = await supabase.auth.reauthenticate();
+    if (error) {
+      setMessage("No pudimos enviar el código de seguridad. Intentá nuevamente.");
+    } else {
+      setPasswordNonceRequested(true);
+      setMessage("Te enviamos un código de seguridad al correo de la cuenta.");
+    }
     setBusy(false);
   }
 
   async function sendPasswordRecovery(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!requireCaptcha()) return;
     const form = new FormData(event.currentTarget);
     setBusy(true);
     setMessage("");
     const { error } = await supabase.auth.resetPasswordForEmail(
       String(form.get("email")),
-      { redirectTo: window.location.origin + window.location.pathname },
+      {
+        redirectTo: window.location.origin + window.location.pathname,
+        captchaToken,
+      },
     );
+    resetCaptcha();
     setMessage(
       error
         ? friendlyAuthError(error)
@@ -1981,43 +2201,23 @@ export default function Home() {
     }
     setBusy(true);
     setMessage("");
-    const safeName = quotePdfFile.name
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-zA-Z0-9._-]/g, "-");
-    const filePath = `${selectedProviderQuote.id}/${createUuid()}-${safeName}`;
-    const { error: uploadError } = await supabase.storage
-      .from("pdf-cotizaciones")
-      .upload(filePath, quotePdfFile, {
-        contentType: "application/pdf",
-        upsert: false,
-      });
-    if (uploadError) {
-      setMessage(uploadError.message);
+    let filePath: string;
+    try {
+      filePath = await uploadSecureFile(
+        "pdf_cotizacion",
+        selectedProviderQuote.id,
+        quotePdfFile,
+      );
+    } catch {
+      setMessage("El PDF no superó la validación de seguridad.");
       setBusy(false);
       return;
-    }
-    const { data: previousPath, error } = await supabase.rpc(
-      "actualizar_pdf_cotizacion",
-      {
-        p_cotizacion_id: selectedProviderQuote.id,
-        p_pdf_path: filePath,
-      },
-    );
-    if (error) {
-      await supabase.storage.from("pdf-cotizaciones").remove([filePath]);
-      setMessage(error.message);
-      setBusy(false);
-      return;
-    }
-    if (typeof previousPath === "string" && previousPath !== filePath) {
-      await supabase.storage.from("pdf-cotizaciones").remove([previousPath]);
     }
     const updatedQuote = { ...selectedProviderQuote, pdfPath: filePath };
     setSelectedProviderQuote(updatedQuote);
     setQuotePdfFile(null);
     setMessage(
-      previousPath
+      selectedProviderQuote.pdfPath
         ? "PDF reemplazado correctamente."
         : "PDF cargado correctamente.",
     );
@@ -2378,16 +2578,22 @@ export default function Home() {
       return;
     }
     const form = new FormData(event.currentTarget);
+    const destination = safeHttpsUrl(form.get("enlace_destino"));
+    if (!destination) {
+      setMessage("El enlace del anuncio debe usar HTTPS.");
+      return;
+    }
     setBusy(true);
     setMessage("");
-    const extension = adImage.name.split(".").pop()?.toLowerCase() || "webp";
-    const path = `${String(form.get("campana_id"))}/${createUuid()}.${extension}`;
-    const upload = await supabase.storage.from("publicidad").upload(path, adImage, {
-      contentType: adImage.type,
-      upsert: false,
-    });
-    if (upload.error) {
-      setMessage(upload.error.message);
+    let path: string;
+    try {
+      path = await uploadSecureFile(
+        "publicidad",
+        String(form.get("campana_id")),
+        adImage,
+      );
+    } catch {
+      setMessage("La imagen no superó la validación de seguridad.");
       setBusy(false);
       return;
     }
@@ -2397,7 +2603,7 @@ export default function Home() {
       titulo: form.get("titulo"),
       texto: form.get("texto") || null,
       imagen_path: path,
-      enlace_destino: form.get("enlace_destino"),
+      enlace_destino: destination,
       texto_boton: form.get("texto_boton") || "Conocer más",
     });
     if (error) await supabase.storage.from("publicidad").remove([path]);
@@ -2441,18 +2647,30 @@ export default function Home() {
     event.preventDefault();
     if (!editingAd) return;
     const form = new FormData(event.currentTarget);
+    const destination = safeHttpsUrl(form.get("enlace_destino"));
+    if (!destination) {
+      setMessage("El enlace del anuncio debe usar HTTPS.");
+      return;
+    }
     setBusy(true); setMessage("");
     let nextPath = editingAd.imagen_path;
     if (replacementAdImage) {
-      const extension = replacementAdImage.name.split(".").pop()?.toLowerCase() || "webp";
-      nextPath = `${String(form.get("campana_id"))}/${createUuid()}.${extension}`;
-      const upload = await supabase.storage.from("publicidad").upload(nextPath, replacementAdImage, { contentType: replacementAdImage.type, upsert: false });
-      if (upload.error) { setMessage(upload.error.message); setBusy(false); return; }
+      try {
+        nextPath = await uploadSecureFile(
+          "publicidad",
+          String(form.get("campana_id")),
+          replacementAdImage,
+        );
+      } catch {
+        setMessage("La imagen no superó la validación de seguridad.");
+        setBusy(false);
+        return;
+      }
     }
     const { error } = await supabase.from("anuncios").update({
       campana_id: form.get("campana_id"), ubicacion_id: form.get("ubicacion_id"),
       titulo: form.get("titulo"), texto: form.get("texto") || null,
-      enlace_destino: form.get("enlace_destino"), texto_boton: form.get("texto_boton") || "Conocer más",
+      enlace_destino: destination, texto_boton: form.get("texto_boton") || "Conocer más",
       imagen_path: nextPath, actualizado_en: new Date().toISOString(),
     }).eq("id", editingAd.id);
     if (error && nextPath !== editingAd.imagen_path) await supabase.storage.from("publicidad").remove([nextPath]);
@@ -2635,38 +2853,11 @@ export default function Home() {
               : null;
       let attachmentError = false;
       if (requestFiles.length && requestId) {
-        const { data: userData } = await supabase.auth.getUser();
         for (const file of requestFiles) {
-          const safeName = file.name
-            .normalize("NFD")
-            .replace(/[\u0300-\u036f]/g, "")
-            .replace(/[^a-zA-Z0-9._-]/g, "-");
-          const filePath = `${requestId}/${createUuid()}-${safeName}`;
-          const { error: uploadError } = await supabase.storage
-            .from("adjuntos-solicitudes")
-            .upload(filePath, file, {
-              contentType: file.type || "application/octet-stream",
-              upsert: false,
-            });
-          if (uploadError || !userData.user) {
+          try {
+            await uploadSecureFile("adjunto_solicitud", requestId, file);
+          } catch {
             attachmentError = true;
-            continue;
-          }
-          const { error: recordError } = await supabase
-            .from("adjuntos_solicitud")
-            .insert({
-              solicitud_id: requestId,
-              nombre_archivo: file.name,
-              archivo_path: filePath,
-              tipo_mime: file.type || null,
-              tamano_bytes: file.size,
-              cargado_por: userData.user.id,
-            });
-          if (recordError) {
-            attachmentError = true;
-            await supabase.storage
-              .from("adjuntos-solicitudes")
-              .remove([filePath]);
           }
         }
       } else if (requestFiles.length) attachmentError = true;
@@ -3239,46 +3430,17 @@ export default function Home() {
     setBusy(true);
     setMessage("");
     const user = (await supabase.auth.getUser()).data.user;
-    const extension =
-      verificationFile.name.split(".").pop()?.toLowerCase() || "pdf";
-    const path = `${account.empresas.id}/constancia-cuit-${Date.now()}.${extension}`;
-    const upload = await supabase.storage
-      .from("documentos-empresas")
-      .upload(path, verificationFile, { upsert: false });
-    if (upload.error) {
-      setMessage(upload.error.message);
+    try {
+      await uploadSecureFile(
+        "constancia_cuit",
+        account.empresas.id,
+        verificationFile,
+      );
+    } catch {
+      setMessage("La constancia no superó la validación de seguridad.");
       setBusy(false);
       return;
     }
-    const documentInsert = await supabase.from("documentos_empresa").insert({
-      empresa_id: account.empresas.id,
-      tipo_documento: "constancia_cuit",
-      archivo_path: path,
-      estado: "pendiente",
-      cargado_por: user?.id,
-    });
-    if (documentInsert.error) {
-      setMessage(documentInsert.error.message);
-      setBusy(false);
-      return;
-    }
-    const update = await supabase
-      .from("empresas")
-      .update({ estado: "pendiente", motivo_observacion: null })
-      .eq("id", account.empresas.id);
-    if (update.error) {
-      setMessage(update.error.message);
-      setBusy(false);
-      return;
-    }
-    await supabase.from("eventos_auditoria").insert({
-      empresa_id: account.empresas.id,
-      usuario_id: user?.id,
-      entidad: "empresa",
-      entidad_id: account.empresas.id,
-      accion: "verificacion_enviada",
-      detalle: { documento: "constancia_cuit" },
-    });
     setVerificationOpen(false);
     setVerificationFile(null);
     setMessage(
@@ -3290,6 +3452,7 @@ export default function Home() {
 
   async function login(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!requireCaptcha()) return;
     setBusy(true);
     setMessage("");
     const data = new FormData(event.currentTarget);
@@ -3297,12 +3460,14 @@ export default function Home() {
     const { data: authData, error } = await supabase.auth.signInWithPassword({
       email,
       password: String(data.get("password")),
+      options: { captchaToken },
     });
+    resetCaptcha();
     if (error) setMessage(friendlyAuthError(error));
     else if (authData.user) {
       if (rememberLoginEmail)
-        localStorage.setItem("miconect-remembered-email", email);
-      else localStorage.removeItem("miconect-remembered-email");
+        sessionStorage.setItem("miconect-remembered-email", email);
+      else sessionStorage.removeItem("miconect-remembered-email");
       await loadAccount(authData.user.id);
     }
     setBusy(false);
@@ -3310,6 +3475,7 @@ export default function Home() {
 
   async function register(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!orphanUser && !requireCaptcha()) return;
     setBusy(true);
     setMessage("");
     const data = new FormData(event.currentTarget);
@@ -3334,17 +3500,6 @@ export default function Home() {
     const cuit = String(data.get("cuit")).replace(/\D/g, "");
     const cuitAvailable = await validateRegistrationCuit(cuit);
     if (!cuitAvailable) {
-      setBusy(false);
-      return;
-    }
-    const { data: emailAvailable, error: emailAvailabilityError } =
-      await supabase.rpc("email_disponible_registro", { p_email: email });
-    if (emailAvailabilityError || emailAvailable !== true) {
-      setMessage(
-        emailAvailabilityError
-          ? "No pudimos validar el correo en este momento. Intentá nuevamente."
-          : "Este correo no está habilitado para registrarse. Contactá a soporte si necesitás revisarlo.",
-      );
       setBusy(false);
       return;
     }
@@ -3374,7 +3529,7 @@ export default function Home() {
               .map((category) => category.nombre)
           : [],
     };
-    localStorage.setItem("miconect-pending-company", JSON.stringify(pending));
+    sessionStorage.setItem("miconect-pending-company", JSON.stringify(pending));
     if (orphanUser) {
       try {
         await finishPendingRegistration(pending);
@@ -3394,31 +3549,22 @@ export default function Home() {
       options: {
         emailRedirectTo: `${window.location.origin}${window.location.pathname}`,
         data: { miconect_pending_company: pending },
+        captchaToken,
       },
     });
+    resetCaptcha();
 
     if (authError) {
-      localStorage.removeItem("miconect-pending-company");
+      sessionStorage.removeItem("miconect-pending-company");
       setMessage(friendlyAuthError(authError));
       setBusy(false);
       return;
     }
 
     if (!authData.session) {
-      if (authData.user?.identities?.length === 0) {
-        localStorage.removeItem("miconect-pending-company");
-        setLoginEmail(email);
-        setMessage(
-          "Este correo ya tiene una cuenta. Ingresá con tu contraseña o usá la recuperación de acceso.",
-        );
-        setView("login");
-        window.scrollTo({ top: 0, behavior: "smooth" });
-        setBusy(false);
-        return;
-      }
       setPendingConfirmationEmail(email);
       setConfirmationMessage(
-        `Cuenta creada. Enviamos la confirmación a ${email}. Revisá también Spam y Promociones.`,
+        "Si los datos permiten crear una cuenta, recibirás un correo de confirmación. Revisá también Spam y Promociones.",
       );
       setMessage("");
       setView("home");
@@ -3465,30 +3611,11 @@ export default function Home() {
     }
   }
 
-  async function validateRegistrationCuit(rawCuit: string) {
+  function validateRegistrationCuit(rawCuit: string) {
     const cuit = rawCuit.replace(/\D/g, "");
     setRegistrationCheckedCuit(cuit);
     if (cuit.length !== 11) {
       setRegistrationCuitStatus("invalid");
-      return false;
-    }
-    setRegistrationCuitStatus("checking");
-    const { data, error } = await supabase.rpc("cuit_disponible_registro", {
-      p_cuit: cuit,
-    });
-    if (error) {
-      console.error("No se pudo validar el CUIT", error);
-      setRegistrationCuitStatus("service-error");
-      setMessage(
-        "No pudimos validar el CUIT en este momento. Intentá nuevamente.",
-      );
-      return false;
-    }
-    if (data !== true) {
-      setRegistrationCuitStatus("unavailable");
-      setMessage(
-        "Ese CUIT ya pertenece a una empresa registrada. Ingresá con una cuenta existente o contactá a soporte para solicitar acceso.",
-      );
       return false;
     }
     setRegistrationCuitStatus("available");
@@ -3510,7 +3637,7 @@ export default function Home() {
           <div className="form-heading">
             <span>Recuperación segura</span>
             <h1>Creá una contraseña nueva</h1>
-            <p>Ingresá una contraseña de al menos ocho caracteres.</p>
+            <p>Ingresá una contraseña de al menos doce caracteres, con mayúsculas, minúsculas, números y símbolos.</p>
           </div>
           <form onSubmit={finishPasswordRecovery}>
             <label>
@@ -3538,6 +3665,56 @@ export default function Home() {
 
   if (account) {
     const admin = account.rol === "administrador_plataforma";
+    if (admin && adminMfaStatus !== "verified") {
+      return (
+        <main className="mfa-gate-shell">
+          <section className="form-shell narrow mfa-gate-card">
+            <div className="form-heading">
+              <span>Acceso administrativo protegido</span>
+              <h1>Verificación en dos pasos</h1>
+              <p>
+                La administración de la plataforma requiere un segundo factor TOTP en cada sesión.
+              </p>
+            </div>
+            {adminMfaStatus === "checking" && <p>Comprobando la seguridad de la cuenta…</p>}
+            {adminMfaStatus === "enroll" && adminMfaQrCode && (
+              <div className="mfa-enrollment">
+                <p>Escaneá este código con una aplicación autenticadora y escribí el código generado.</p>
+                <img src={adminMfaQrCode} alt="Código QR para activar el segundo factor" />
+              </div>
+            )}
+            {(adminMfaStatus === "enroll" || adminMfaStatus === "challenge") && (
+              <form onSubmit={verifyAdminMfa}>
+                <label>
+                  Código de seis dígitos
+                  <input
+                    name="code"
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    pattern="[0-9]{6}"
+                    maxLength={6}
+                    required
+                    autoFocus
+                  />
+                </label>
+                <button className="primary full" disabled={busy}>
+                  {busy ? "Verificando…" : "Verificar y continuar"}
+                </button>
+              </form>
+            )}
+            {adminMfaStatus === "error" && (
+              <button className="primary full" onClick={() => void initializeAdminMfa()}>
+                Reintentar verificación
+              </button>
+            )}
+            <button className="text-button" onClick={() => void supabase.auth.signOut()}>
+              Cerrar sesión
+            </button>
+            {message && <p className="notice">{message}</p>}
+          </section>
+        </main>
+      );
+    }
     const canBuy = companyCanBuy(account.empresas);
     const canSell = companyCanSell(account.empresas);
     const buyer = !admin && canBuy && (!canSell || companyMode === "buyer");
@@ -3665,7 +3842,7 @@ export default function Home() {
                   className={buyer ? "active" : ""}
                   onClick={() => {
                     setCompanyMode("buyer");
-                    localStorage.setItem("miconect-company-mode", "buyer");
+                    sessionStorage.setItem("miconect-company-mode", "buyer");
                     setMessage("");
                     void loadRows(account, "buyer");
                     void loadBuyerQuotes();
@@ -3686,7 +3863,7 @@ export default function Home() {
                   className={!buyer ? "active" : ""}
                   onClick={() => {
                     setCompanyMode("provider");
-                    localStorage.setItem("miconect-company-mode", "provider");
+                    sessionStorage.setItem("miconect-company-mode", "provider");
                     setMessage("");
                     void loadRows(account, "provider");
                     if (account.empresas) {
@@ -4094,7 +4271,7 @@ export default function Home() {
                     {buyerAd.texto && <p>{buyerAd.texto}</p>}
                   </div>
                   <a
-                    href={buyerAd.enlace_destino}
+                    href={safeHttpsUrl(buyerAd.enlace_destino) ?? undefined}
                     target="_blank"
                     rel="noopener noreferrer sponsored"
                     onClick={() => registerAdEvent(buyerAd.id, "clic")}
@@ -4115,7 +4292,7 @@ export default function Home() {
                     {providerAd.texto && <p>{providerAd.texto}</p>}
                   </div>
                   <a
-                    href={providerAd.enlace_destino}
+                    href={safeHttpsUrl(providerAd.enlace_destino) ?? undefined}
                     target="_blank"
                     rel="noopener noreferrer sponsored"
                     onClick={() => registerAdEvent(providerAd.id, "clic")}
@@ -4202,7 +4379,7 @@ export default function Home() {
               <article className="sponsored-banner request-list-ad">
                 <img src={supabase.storage.from("publicidad").getPublicUrl(requestListAd.imagen_path).data.publicUrl} alt="" />
                 <div><small>{requestListAd.etiqueta || "Publicidad"}</small><h2>{requestListAd.titulo}</h2>{requestListAd.texto && <p>{requestListAd.texto}</p>}</div>
-                <a href={requestListAd.enlace_destino} target="_blank" rel="noopener noreferrer sponsored" onClick={() => registerAdEvent(requestListAd.id, "clic")}>{requestListAd.texto_boton || "Conocer más"}</a>
+                <a href={safeHttpsUrl(requestListAd.enlace_destino) ?? undefined} target="_blank" rel="noopener noreferrer sponsored" onClick={() => registerAdEvent(requestListAd.id, "clic")}>{requestListAd.texto_boton || "Conocer más"}</a>
               </article>
             )}
             <section className="panel-list">
@@ -5967,7 +6144,7 @@ export default function Home() {
                     <input
                       type="file"
                       multiple
-                      accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,.xls,.xlsx"
+                      accept="application/pdf,image/png,image/jpeg,image/webp"
                       onChange={(event) =>
                         setRequestFiles(
                           Array.from(event.target.files ?? []).slice(0, 5),
@@ -6468,7 +6645,7 @@ export default function Home() {
                     const publicUrl = supabase.storage.from("publicidad").getPublicUrl(creative.imagen_path).data.publicUrl;
                     const impressions = adMetrics.filter((item) => item.anuncio_id === creative.id && item.tipo === "impresion").length;
                     const clicks = adMetrics.filter((item) => item.anuncio_id === creative.id && item.tipo === "clic").length;
-                    return <article className={!creative.activo ? "is-paused" : ""} key={creative.id}><img src={publicUrl} alt="" /><div><small>{creative.ubicaciones_publicidad?.nombre} · {creative.activo ? "Activo" : "Pausado"}</small><b>{creative.titulo}</b><span>{impressions} impresiones · {clicks} clics</span></div><div className="ad-row-actions"><a href={creative.enlace_destino} target="_blank" rel="noreferrer">Abrir</a><button className="secondary" onClick={() => { setEditingAd(creative); setReplacementAdImage(null); }}>Editar</button><button className="secondary" onClick={() => toggleAdvertisement(creative)} disabled={busy}>{creative.activo ? "Pausar" : "Activar"}</button><button className="danger" onClick={() => deleteAdvertisement(creative)} disabled={busy}>Eliminar</button></div></article>;
+                    return <article className={!creative.activo ? "is-paused" : ""} key={creative.id}><img src={publicUrl} alt="" /><div><small>{creative.ubicaciones_publicidad?.nombre} · {creative.activo ? "Activo" : "Pausado"}</small><b>{creative.titulo}</b><span>{impressions} impresiones · {clicks} clics</span></div><div className="ad-row-actions"><a href={safeHttpsUrl(creative.enlace_destino) ?? undefined} target="_blank" rel="noreferrer">Abrir</a><button className="secondary" onClick={() => { setEditingAd(creative); setReplacementAdImage(null); }}>Editar</button><button className="secondary" onClick={() => toggleAdvertisement(creative)} disabled={busy}>{creative.activo ? "Pausar" : "Activar"}</button><button className="danger" onClick={() => deleteAdvertisement(creative)} disabled={busy}>Eliminar</button></div></article>;
                   })}</div>
                 </section>
               )}
@@ -6672,12 +6849,10 @@ export default function Home() {
                           <button
                             className="secondary"
                             onClick={async () => {
-                              const link = `${window.location.origin}${window.location.pathname}?invite=${invitation.token}`;
-                              await navigator.clipboard.writeText(link);
-                              setMessage("Enlace de invitación copiado.");
+                              setMessage("Por seguridad, el token solo se muestra al crear la invitación. Creá una nueva si necesitás reenviarla.");
                             }}
                           >
-                            Copiar enlace
+                            Reenviar de forma segura
                           </button>
                         </div>
                       ))}
@@ -6751,7 +6926,7 @@ export default function Home() {
                     <span>Seguridad</span>
                     <h2>Cambiar contraseña</h2>
                     <p>
-                      Utilizá una contraseña nueva de al menos ocho caracteres.
+                      Utilizá una contraseña nueva de al menos doce caracteres, con mayúsculas, minúsculas, números y símbolos.
                     </p>
                   </div>
                   <label>
@@ -6766,6 +6941,25 @@ export default function Home() {
                     <PasswordInput
                       name="confirmation"
                       autoComplete="new-password"
+                    />
+                  </label>
+                  <button
+                    className="text-button"
+                    type="button"
+                    onClick={() => void requestPasswordNonce()}
+                    disabled={busy}
+                  >
+                    {passwordNonceRequested ? "Reenviar código de seguridad" : "Enviar código de seguridad"}
+                  </button>
+                  <label>
+                    Código de seguridad
+                    <input
+                      name="nonce"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      pattern="[0-9]{6}"
+                      maxLength={6}
+                      required
                     />
                   </label>
                   <button className="secondary" disabled={busy}>
@@ -7529,7 +7723,7 @@ export default function Home() {
               <article className="sponsored-banner public-sponsored-banner">
                 <img src={supabase.storage.from("publicidad").getPublicUrl(publicAd.imagen_path).data.publicUrl} alt="" />
                 <div><small>{publicAd.etiqueta || "Publicidad"}</small><h2>{publicAd.titulo}</h2>{publicAd.texto && <p>{publicAd.texto}</p>}</div>
-                <a href={publicAd.enlace_destino} target="_blank" rel="noopener noreferrer sponsored" onClick={() => registerAdEvent(publicAd.id, "clic")}>{publicAd.texto_boton || "Conocer más"}</a>
+                <a href={safeHttpsUrl(publicAd.enlace_destino) ?? undefined} target="_blank" rel="noopener noreferrer sponsored" onClick={() => registerAdEvent(publicAd.id, "clic")}>{publicAd.texto_boton || "Conocer más"}</a>
               </article>
             </section>
           )}
@@ -7614,7 +7808,7 @@ export default function Home() {
                   name="password"
                   autoComplete="new-password"
                 />
-                <small>Mínimo 8 caracteres.</small>
+                <small>Mínimo 12 caracteres, con mayúsculas, minúsculas, números y símbolos.</small>
               </label>
               <label>
                 Repetir contraseña
@@ -7623,7 +7817,8 @@ export default function Home() {
                   autoComplete="new-password"
                 />
               </label>
-              <button className="primary full" disabled={busy || !inviteToken}>
+              <TurnstileChallenge key={captchaGeneration} onToken={setCaptchaToken} />
+              <button className="primary full" disabled={busy || !inviteToken || !captchaToken}>
                 {busy ? "Creando acceso…" : "Aceptar invitación"}
               </button>
             </form>
@@ -7669,7 +7864,8 @@ export default function Home() {
               />
               <span>Recordar mi correo en este dispositivo</span>
             </label>
-            <button className="primary full" disabled={busy}>
+            <TurnstileChallenge key={captchaGeneration} onToken={setCaptchaToken} />
+            <button className="primary full" disabled={busy || !captchaToken}>
               {busy ? "Ingresando…" : "Ingresar"}
             </button>
           </form>
@@ -7703,7 +7899,8 @@ export default function Home() {
               Correo electrónico
               <input name="email" type="email" required autoComplete="email" />
             </label>
-            <button className="primary full" disabled={busy}>
+            <TurnstileChallenge key={captchaGeneration} onToken={setCaptchaToken} />
+            <button className="primary full" disabled={busy || !captchaToken}>
               {busy ? "Enviando…" : "Enviar enlace de recuperación"}
             </button>
           </form>
@@ -7784,32 +7981,21 @@ export default function Home() {
                 }}
                 onBlur={(event) => {
                   const cuit = event.target.value.replace(/\D/g, "");
-                  if (cuit.length === 11) void validateRegistrationCuit(cuit);
+                  if (cuit.length === 11) validateRegistrationCuit(cuit);
                   else if (cuit.length > 0) {
                     setRegistrationCheckedCuit(cuit);
                     setRegistrationCuitStatus("invalid");
                   }
                 }}
               />
-              {registrationCuitStatus === "checking" && (
-                <small className="field-feedback">Verificando CUIT…</small>
-              )}
               {registrationCuitStatus === "available" && (
-                <small className="field-feedback success">CUIT disponible.</small>
-              )}
-              {registrationCuitStatus === "unavailable" && (
-                <small className="field-feedback error">
-                  Este CUIT ya está registrado. Solicitá acceso a la cuenta de la empresa.
+                <small className="field-feedback success">
+                  Formato válido. La disponibilidad se confirma al crear la empresa.
                 </small>
               )}
               {registrationCuitStatus === "invalid" && (
                 <small className="field-feedback error">
                   Ingresá los 11 números del CUIT para validarlo.
-                </small>
-              )}
-              {registrationCuitStatus === "service-error" && (
-                <small className="field-feedback error">
-                  No pudimos validar el CUIT. Intentá nuevamente.
                 </small>
               )}
             </label>
@@ -7903,7 +8089,7 @@ export default function Home() {
                     name="password"
                     autoComplete="new-password"
                   />
-                  <small>Mínimo 8 caracteres.</small>
+                  <small>Mínimo 12 caracteres, con mayúsculas, minúsculas, números y símbolos.</small>
                 </label>
                 <label className="password-field-label">
                   Repetir contraseña
@@ -7928,7 +8114,12 @@ export default function Home() {
                 .
               </span>
             </label>
-            <button className="primary full wide" disabled={busy}>
+            {!orphanUser && (
+              <div className="wide">
+                <TurnstileChallenge key={captchaGeneration} onToken={setCaptchaToken} />
+              </div>
+            )}
+            <button className="primary full wide" disabled={busy || (!orphanUser && !captchaToken)}>
               {busy ? "Creando cuenta…" : "Crear cuenta empresarial"}
             </button>
           </form>
