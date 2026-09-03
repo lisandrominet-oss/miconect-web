@@ -4,6 +4,7 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
+import CordilleraLanding from "./cordillera-landing";
 
 declare global {
   interface Window {
@@ -7639,8 +7640,8 @@ export default function Home() {
   }
 
   return (
-    <main>
-      <nav className="nav">
+    <div>
+      {view !== "home" && <nav className="nav">
         <button
           className="brand"
           onClick={() => setView("home")}
@@ -7657,102 +7658,35 @@ export default function Home() {
             Registrar empresa
           </button>
         </div>
-      </nav>
+      </nav>}
 
       {view === "home" && (
-        <>
-          {pendingConfirmationEmail && (
-            <section className="registration-confirmation" aria-live="polite">
-              <div>
-                <span>Registro iniciado</span>
-                <h2>Confirmá tu correo para completar la empresa</h2>
-                <p>{confirmationMessage}</p>
-              </div>
-              <div className="registration-confirmation-actions">
-                <button
-                  type="button"
-                  className="secondary"
-                  disabled={busy}
-                  onClick={resendRegistrationConfirmation}
-                >
-                  {busy ? "Reenviando…" : "Reenviar correo"}
-                </button>
-                <button
-                  type="button"
-                  className="text-button"
-                  onClick={() => {
-                    setLoginEmail(pendingConfirmationEmail);
-                    setMessage("");
-                    setView("login");
-                  }}
-                >
-                  Ir a ingresar
-                </button>
-              </div>
-            </section>
+        <CordilleraLanding
+          onLogin={() => setView("login")}
+          onRegister={() => setView("register")}
+          supplementaryContent={(
+            <>
+              {pendingConfirmationEmail && (
+                <section className="registration-confirmation" aria-live="polite">
+                  <div><span>Registro iniciado</span><h2>Confirmá tu correo para completar la empresa</h2><p>{confirmationMessage}</p></div>
+                  <div className="registration-confirmation-actions">
+                    <button type="button" className="secondary" disabled={busy} onClick={resendRegistrationConfirmation}>{busy ? "Reenviando…" : "Reenviar correo"}</button>
+                    <button type="button" className="text-button" onClick={() => { setLoginEmail(pendingConfirmationEmail); setMessage(""); setView("login"); }}>Ir a ingresar</button>
+                  </div>
+                </section>
+              )}
+              {publicAd && (
+                <section className="public-ad-shell">
+                  <article className="sponsored-banner public-sponsored-banner">
+                    <img src={supabase.storage.from("publicidad").getPublicUrl(publicAd.imagen_path).data.publicUrl} alt="" />
+                    <div><small>{publicAd.etiqueta || "Publicidad"}</small><h2>{publicAd.titulo}</h2>{publicAd.texto && <p>{publicAd.texto}</p>}</div>
+                    <a href={safeHttpsUrl(publicAd.enlace_destino) ?? undefined} target="_blank" rel="noopener noreferrer sponsored" onClick={() => registerAdEvent(publicAd.id, "clic")}>{publicAd.texto_boton || "Conocer más"}</a>
+                  </article>
+                </section>
+              )}
+            </>
           )}
-          <section className="hero">
-            <div className="eyebrow">PLATAFORMA EMPRESARIAL · SAN JUAN</div>
-            <h1>
-              Compraventa minera
-              <br />
-              de San Juan
-            </h1>
-            <p>
-              Solicitudes claras, proveedores verificados y cotizaciones
-              trazables en un solo lugar.
-            </p>
-            <div className="hero-actions">
-              <button className="primary" onClick={() => setView("register")}>
-                Quiero participar <span>→</span>
-              </button>
-              <button className="secondary" onClick={() => setView("login")}>
-                Ya tengo una cuenta
-              </button>
-            </div>
-            <div className="trust-row">
-              <span>Empresas verificadas</span>
-              <i />
-              <span>Cotizaciones privadas</span>
-              <i />
-              <span>Operación local</span>
-            </div>
-          </section>
-          {publicAd && (
-            <section className="public-ad-shell">
-              <article className="sponsored-banner public-sponsored-banner">
-                <img src={supabase.storage.from("publicidad").getPublicUrl(publicAd.imagen_path).data.publicUrl} alt="" />
-                <div><small>{publicAd.etiqueta || "Publicidad"}</small><h2>{publicAd.titulo}</h2>{publicAd.texto && <p>{publicAd.texto}</p>}</div>
-                <a href={safeHttpsUrl(publicAd.enlace_destino) ?? undefined} target="_blank" rel="noopener noreferrer sponsored" onClick={() => registerAdEvent(publicAd.id, "clic")}>{publicAd.texto_boton || "Conocer más"}</a>
-              </article>
-            </section>
-          )}
-          <section className="steps">
-            <article>
-              <b>01</b>
-              <h2>Publicá</h2>
-              <p>
-                Creá una solicitud con productos, cantidades, archivos y fecha
-                límite.
-              </p>
-            </article>
-            <article>
-              <b>02</b>
-              <h2>Cotizá</h2>
-              <p>
-                Los proveedores del rubro reciben el pedido y presentan su
-                oferta.
-              </p>
-            </article>
-            <article>
-              <b>03</b>
-              <h2>Adjudicá</h2>
-              <p>
-                Compará propuestas y elegí por pedido completo o por cada ítem.
-              </p>
-            </article>
-          </section>
-        </>
+        />
       )}
 
       {view === "invite" && (
@@ -8188,6 +8122,6 @@ export default function Home() {
           </article>
         </div>
       )}
-    </main>
+    </div>
   );
 }
